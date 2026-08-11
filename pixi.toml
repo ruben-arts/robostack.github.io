@@ -99,6 +99,14 @@ ensure-tables = {
   cmd = "python scripts/ensure_tables.py",
   description = "Download the deployed package tables where the local copy is missing or older than 6 hours",
 }
+deb-coverage-report = {
+  cmd = "python deb-coverage-report.py --open",
+  description = "Build and open the local report of .deb download popularity vs channel coverage (not deployed)",
+}
+deb-coverage-report-all = {
+  cmd = "python deb-coverage-report.py --all",
+  description = "Build the local .deb download coverage report for every live ROS 2 channel (not deployed)",
+}
 
 [environments]
 default = ["site", "lint", "scripts"]
