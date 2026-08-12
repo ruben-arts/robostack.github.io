@@ -99,6 +99,10 @@ ensure-tables = {
   cmd = "python scripts/ensure_tables.py",
   description = "Download the deployed package tables where the local copy is missing or older than 6 hours",
 }
+update-downloads = {
+  cmd = "python scripts/deb_downloads.py",
+  description = "Regenerate the .deb download counts behind the package pages' popularity data",
+}
 deb-coverage-report = {
   cmd = "python deb-coverage-report.py --open",
   description = "Build and open the local report of .deb download popularity vs channel coverage (not deployed)",

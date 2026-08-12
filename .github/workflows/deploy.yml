@@ -36,7 +36,28 @@ jobs:
         id: update
         continue-on-error: true
         run: pixi run update-tables
+      # The awstats reports behind the download counts are one ~20 MB file per
+      # complete month and never change once published, so the cache only ever
+      # grows by one file a month. Keying on the month makes each key hit until
+      # the month rolls over, when restore-keys carries the old files forward
+      # and the run fetches just the newest report.
+      - name: Compute cache month
+        id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore awstats cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/ros-awstats-cache
+          key: ros-awstats-${{ steps.month.outputs.month }}
+          restore-keys: ros-awstats-
+      # Same failure policy as the tables: a broken awstats fetch must not stop
+      # the deploy. The page treats a missing downloads file as "feature off",
+      # and ensure-tables inside build-docs falls back to the deployed copy.
+      - name: Update download counts
+        id: downloads
+        continue-on-error: true
+        run: pixi run update-downloads --cache-dir ~/ros-awstats-cache --prune-cache
       - run: pixi run gh-deploy
       - name: Surface update failures
-        if: steps.update.outcome == 'failure'
+        if: steps.update.outcome == 'failure' || steps.downloads.outcome == 'failure'
         run: exit 1

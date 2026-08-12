@@ -31,6 +31,24 @@ export interface Upgrade {
   mutex: string;
 }
 
+/** What scripts/deb_downloads.py writes to /data/downloads-<distro>.json. */
+export interface DownloadsDoc {
+  distro: string;
+  window: string;
+  source: string;
+  /** base package name -> .deb hits on packages.ros.org over `window`. */
+  packages: Record<string, number>;
+}
+
+export interface Popularity {
+  hits: number;
+  /** 1-based position in the distro's download ranking. */
+  rank: number;
+}
+
+/** Ranks at or above this count as "popular" in the filter and row marks. */
+export const POPULAR_TOP = 500;
+
 export interface Row {
   name: string;
   desc: string;
@@ -54,6 +72,9 @@ export interface MutexRow extends Row {
   older: string[];
   upgrade: Upgrade | null;
   never: boolean;
+  /** Zero when the package has no recorded downloads (or no data loaded). */
+  hits: number;
+  rank: number;
 }
 
 // rosdistro versions carry a release increment ("2.0.2-1"); drop it to
@@ -107,15 +128,29 @@ export function unpackRows(doc: Doc): Row[] {
 }
 
 /**
+ * name -> hits and rank, from the downloads document. The deb base name and
+ * the conda name share the same hyphenated form, so the names join directly.
+ */
+export function downloadRanks(doc: DownloadsDoc): Map<string, Popularity> {
+  // The writer sorts by hits and JSON preserves the order, but re-sorting
+  // costs nothing and keeps the ranks right even for a hand-edited file.
+  const entries = Object.entries(doc.packages).sort((a, b) => b[1] - a[1]);
+  const ranks = new Map<string, Popularity>();
+  entries.forEach(([name, hits], i) => ranks.set(name, { hits, rank: i + 1 }));
+  return ranks;
+}
+
+/**
  * Every row as seen from the selected mutex. `list` is doc.mutexes, newest
  * first; `bits` are the bit positions of the platforms with any build for
- * that mutex.
+ * that mutex. `popularity` is the download ranking, when it loaded.
  */
 export function deriveMutexRows(
   all: Row[],
   mutex: number,
   list: string[],
   bits: number[],
+  popularity: Map<string, Popularity> | null = null,
 ): MutexRow[] {
   return all.map((row) => {
     const slot = row.builds[mutex];
@@ -145,6 +180,7 @@ export function deriveMutexRows(
     if (upgrade && version && compareVersions(upgrade.version, version) <= 0) {
       upgrade = null;
     }
+    const pop = popularity?.get(row.name);
     return {
       ...row,
       mask,
@@ -161,6 +197,8 @@ export function deriveMutexRows(
       // selected mutex": that one is answered by changing the mutex, this
       // one only by someone adding the package.
       never: !row.builds.some((slot) => Boolean(slot)),
+      hits: pop?.hits ?? 0,
+      rank: pop?.rank ?? 0,
     };
   });
 }
@@ -177,6 +215,9 @@ export function matchesFilter(row: MutexRow, id: string): boolean {
       return row.behind;
     case "upgrade":
       return !!row.upgrade;
+    case "popular":
+      // The gap worth closing first: heavily downloaded, not on the channel.
+      return row.rank > 0 && row.rank <= POPULAR_TOP && row.built === 0;
     default:
       return true;
   }
@@ -187,6 +228,7 @@ export const SORTERS: Record<string, (a: MutexRow, b: MutexRow) => number> = {
   coverage: (a, b) => b.built - a.built || a.name.localeCompare(b.name),
   gaps: (a, b) => a.built - b.built || a.name.localeCompare(b.name),
   recent: (a, b) => b.updated - a.updated || a.name.localeCompare(b.name),
+  downloads: (a, b) => b.hits - a.hits || a.name.localeCompare(b.name),
 };
 
 /**

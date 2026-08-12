@@ -17,11 +17,13 @@
 -->
 <script lang="ts">
   import { onMount } from "svelte";
-  import type { Doc, MutexRow, Row } from "./data";
+  import type { Doc, DownloadsDoc, MutexRow, Row } from "./data";
   import {
     baseVersion,
     deriveMutexRows,
+    downloadRanks,
     matchesFilter,
+    POPULAR_TOP,
     relevanceTier,
     SORTERS,
     unpackRows,
@@ -50,6 +52,7 @@
     { id: "full", label: "Complete" },
     { id: "partial", label: "Partial" },
     { id: "missing", label: "Missing" },
+    { id: "popular", label: "Popular, missing" },
     { id: "behind", label: "Behind index" },
     { id: "upgrade", label: "Newer on a newer mutex" },
   ];
@@ -71,6 +74,11 @@
 
   let doc = $state<Doc | null>(null);
   let error = $state("");
+  /* The download ranking is optional by design: nothing is rendered from it
+   * until the fetch succeeds, so a distro without a downloads file (the EOL
+   * snapshots before the pipeline existed, a fresh deploy) just lacks the
+   * popularity features. */
+  let downloads = $state<DownloadsDoc | null>(null);
 
   let query = $state("");
   let filter = $state("all");
@@ -96,6 +104,7 @@
   const currentMutex = $derived(mutexes[mutex] ?? "");
 
   const all: Row[] = $derived(doc ? unpackRows(doc) : []);
+  const popularity = $derived(downloads ? downloadRanks(downloads) : null);
 
   /* Everything that depends on the selected mutex, derived in one pass:
    * O(n) over 2,300 rows, which is far cheaper than re-fetching. */
@@ -113,13 +122,14 @@
         }),
       );
     const bits = active.map((p) => p.bit);
-    const rows = deriveMutexRows(all, mutex, mutexes, bits);
+    const rows = deriveMutexRows(all, mutex, mutexes, bits, popularity);
 
     const counts: Record<string, number> = {
       all: rows.length,
       full: rows.filter((r) => r.total && r.built === r.total).length,
       partial: rows.filter((r) => r.built > 0 && r.built < r.total).length,
       missing: rows.filter((r) => r.built === 0).length,
+      popular: rows.filter((r) => matchesFilter(r, "popular")).length,
       behind: rows.filter((r) => r.behind).length,
       upgrade: rows.filter((r) => r.upgrade).length,
       older: rows.filter((r) => !r.mask && r.older.length).length,
@@ -128,12 +138,17 @@
     // The summary figure is "how much of the ROS index is on RoboStack", so
     // channel-only packages count in the table but not in this ratio.
     const indexed = rows.filter((r) => r.indexed);
+    // The download-weighted counterpart: hits of the packages available for
+    // this mutex, over the hits of everything in the ranking.
+    const ranked = rows.filter((r) => r.hits > 0);
     return {
       rows,
       active,
       counts,
       indexTotal: indexed.length,
       indexAvailable: indexed.filter((r) => r.built > 0).length,
+      hitsTotal: ranked.reduce((n, r) => n + r.hits, 0),
+      hitsAvailable: ranked.reduce((n, r) => n + (r.built > 0 ? r.hits : 0), 0),
     };
   });
 
@@ -191,6 +206,21 @@
   );
   const currentPct = $derived(Math.max(0, availablePct - behindPct));
 
+  /* The same availability, weighted by each package's .deb downloads: what
+   * share of actual apt usage the channel covers. Null keeps the figure off
+   * the page entirely while no download data is loaded. */
+  const dlPercent = $derived(
+    mutexData.hitsTotal
+      ? Math.round((mutexData.hitsAvailable / mutexData.hitsTotal) * 100)
+      : null,
+  );
+
+  function fmtHits(hits: number): string {
+    if (hits >= 1e6) return (hits / 1e6).toFixed(1) + "M";
+    if (hits >= 1e4) return Math.round(hits / 1e3) + "k";
+    return hits.toLocaleString();
+  }
+
   function updateWindow(): void {
     if (!theadEl) return;
     // <thead> keeps its place regardless of how tall the padding rows are,
@@ -244,6 +274,17 @@
       .catch((cause: Error) => {
         error = cause.message;
       });
+
+    // Optional; failure means the popularity features stay hidden.
+    fetch("/data/downloads-" + distro + ".json")
+      .then((response) => {
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return response.json() as Promise<DownloadsDoc>;
+      })
+      .then((payload) => {
+        downloads = payload;
+      })
+      .catch(() => {});
 
     // One source of truth for the row height, so the windowing maths cannot
     // drift from the stylesheet.
@@ -331,11 +372,29 @@
     <p>Loading packages…</p>
   {:else}
     <div class="rs-summary">
-      <p class="rs-summary__figure">
-        {percent}%<span class="rs-summary__label"
-          >of the packages on the index available on RoboStack</span
-        >
-      </p>
+      <div class="rs-figures">
+        <p class="rs-summary__figure">
+          {percent}%<span class="rs-summary__label"
+            >of the packages on the index available on RoboStack</span
+          >
+        </p>
+        {#if downloads && dlPercent !== null}
+          <!--
+            The package count treats a rarely-installed demo package the same
+            as rclcpp; weighting by .deb downloads answers what share of real
+            apt usage the channel covers, which is the figure that matters to
+            someone deciding whether they can switch.
+          -->
+          <p
+            class="rs-summary__figure"
+            title="Every package weighted by how often its .deb was downloaded from packages.ros.org over {downloads.window}. Hits include CI and mirrors, so read it as a usage share, not a user count."
+          >
+            {dlPercent}%<span class="rs-summary__label"
+              >of {distro} .deb downloads covered ({downloads.window})</span
+            >
+          </p>
+        {/if}
+      </div>
       <div class="rs-bar">
         <i
           class="rs-bar__current"
@@ -425,6 +484,9 @@
           <option value="coverage">Most platforms</option>
           <option value="gaps">Fewest platforms</option>
           <option value="recent">Recently built</option>
+          {#if popularity}
+            <option value="downloads">Most downloaded</option>
+          {/if}
         </select>
       </div>
     </div>
@@ -538,6 +600,24 @@
                       class="rs-ver rs-ver--index"
                       title="Released in the ROS index, not built on {channel}"
                       >{baseVersion(row.indexVersion)}</span
+                    >
+                  {/if}
+                  <!--
+                    Only the head of the ranking gets a mark; a "top 2000"
+                    pill on most rows would say nothing. Quiet grey: this is
+                    context, not a state to act on.
+                  -->
+                  {#if downloads && row.rank > 0 && row.rank <= POPULAR_TOP}
+                    <span
+                      class="rs-pop"
+                      title="#{row.rank} most-downloaded {distro} package on packages.ros.org: {fmtHits(
+                        row.hits,
+                      )} .deb downloads {downloads.window}"
+                      >top {row.rank <= 100
+                        ? 100
+                        : row.rank <= 250
+                          ? 250
+                          : POPULAR_TOP}</span
                     >
                   {/if}
                   {#if row.version}
@@ -703,6 +783,14 @@
     border-radius: 0.5rem;
     padding: 1rem 1.25rem;
     margin-bottom: 1rem;
+  }
+  /* The plain count and the download-weighted count side by side; they wrap
+     to their own lines when the card is narrow. */
+  .rs-figures {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.25rem 2.5rem;
   }
   .rs-summary__figure {
     margin: 0;
@@ -888,6 +976,9 @@
     color: var(--rs-warn-fg);
   }
   .rs-chipcount--missing {
+    color: var(--sl-color-gray-3);
+  }
+  .rs-chipcount--popular {
     color: var(--sl-color-gray-3);
   }
   .rs-chipcount--behind {
@@ -1083,7 +1174,8 @@
      only on close reading. */
   .rs-behind,
   .rs-elsewhere,
-  .rs-upgrade {
+  .rs-upgrade,
+  .rs-pop {
     flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
@@ -1102,6 +1194,13 @@
   .rs-elsewhere {
     background: var(--sl-color-gray-6);
     color: var(--sl-color-gray-3);
+  }
+  /* Head of the download ranking. Context rather than a state, so it stays
+     as quiet as the elsewhere pill; the tooltip carries the numbers. */
+  .rs-pop {
+    background: var(--sl-color-gray-6);
+    color: var(--sl-color-gray-2);
+    font-weight: 400;
   }
   /* A newer mutex has this package, or a newer build of it. The one gap the
      reader can close, so it carries the accent rather than a warning colour:

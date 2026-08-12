@@ -10,6 +10,12 @@ deployed copy from the live site instead, skipping any file younger than
 
 A stale copy that fails to redownload is kept with a warning; a distro that ends
 up with no file at all is an error, because the site cannot build without it.
+
+The download counts (`downloads-<distro>.json`, written by scripts/deb_downloads.py
+in the deploy workflow) ride along under the same freshness rule, for every distro
+rather than only the regenerable ones. Unlike the tables they are optional: the
+page treats a missing file as "no popularity data", so failing to fetch one is
+never an error.
 """
 
 from __future__ import annotations
@@ -46,30 +52,44 @@ def main() -> None:
 
     missing: list[str] = []
     for entry in json.loads(DISTROS_JSON.read_text())["distros"]:
-        if not entry["dataChannel"]:
-            continue
         name = entry["name"]
-        path = DATA_DIR / f"{name}.json"
-        if path.exists() and time.time() - path.stat().st_mtime < max_age_seconds:
-            print(f"{name}: fresh", file=sys.stderr)
-            continue
-        try:
-            response = session.get(f"{SITE}/{name}.json")
-            response.raise_for_status()
-            body = response.content or b""
-        except Exception as error:  # noqa: BLE001 - stale data is usable, absent data is not
-            if path.exists():
-                print(f"{name}: keeping stale copy, download failed ({error})", file=sys.stderr)
-            else:
-                print(f"{name}: no local copy and download failed ({error})", file=sys.stderr)
-                missing.append(name)
-            continue
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(body)
-        print(f"{name}: downloaded", file=sys.stderr)
+        # The table, for distros the pipeline regenerates. Required: without
+        # it the page has nothing to show.
+        if entry["dataChannel"]:
+            ensure(f"{name}.json", max_age_seconds, missing)
+        # The download counts, for every distro. Optional by design.
+        ensure(f"downloads-{name}.json", max_age_seconds, None)
 
     if missing:
         sys.exit(f"no table data for: {', '.join(missing)}")
+
+
+def ensure(filename: str, max_age_seconds: float, missing: list[str] | None) -> None:
+    """Fetch one deployed data file unless the local copy is fresh.
+
+    `missing` collects fatal absences; None marks the file as optional, where
+    the only trace of a failed download is the warning.
+    """
+    path = DATA_DIR / filename
+    if path.exists() and time.time() - path.stat().st_mtime < max_age_seconds:
+        print(f"{filename}: fresh", file=sys.stderr)
+        return
+    try:
+        response = session.get(f"{SITE}/{filename}")
+        response.raise_for_status()
+        body = response.content or b""
+    except Exception as error:  # noqa: BLE001 - stale data is usable, absent data is not
+        if path.exists():
+            print(f"{filename}: keeping stale copy, download failed ({error})", file=sys.stderr)
+        elif missing is None:
+            print(f"{filename}: not available ({error})", file=sys.stderr)
+        else:
+            print(f"{filename}: no local copy and download failed ({error})", file=sys.stderr)
+            missing.append(filename)
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    print(f"{filename}: downloaded", file=sys.stderr)
 
 
 if __name__ == "__main__":
